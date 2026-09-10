@@ -6,11 +6,12 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 def rectangle(a, b, size):
     x1, x2 = sorted((round(a[0]), round(b[0])))
     y1, y2 = sorted((round(a[1]), round(b[1])))
-    return max(0, x1), max(0, y1), min(size[0], x2), min(size[1], y2)
+    # Mouse endpoints identify pixels; Pillow's crop/paste right edge is exclusive.
+    return max(0, x1), max(0, y1), min(size[0], x2 + 1), min(size[1], y2 + 1)
 
 
 def edit(image, tool, a, b, color='#ef4444', width=5, text='', font_size=28):
-    out = image.copy().convert('RGB')
+    out = image.convert('RGB')
     draw = ImageDraw.Draw(out)
     box = rectangle(a, b, out.size)
     if tool in ('hide', 'blur', 'rect'):
@@ -22,7 +23,7 @@ def edit(image, tool, a, b, color='#ef4444', width=5, text='', font_size=28):
         elif tool == 'blur':
             out.paste(out.crop(box).filter(ImageFilter.GaussianBlur(14)), box)
         else:
-            draw.rectangle(box, outline=color, width=width)
+            draw.rectangle((box[0], box[1], box[2] - 1, box[3] - 1), outline=color, width=width)
     elif tool in ('line', 'arrow'):
         draw.line([a, b], fill=color, width=width)
         if tool == 'arrow' and math.dist(a, b) > 2:

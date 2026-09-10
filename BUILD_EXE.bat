@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 .venv\Scripts\python.exe -m pip install PyInstaller==6.13.0
 if errorlevel 1 goto error
-.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --name LocalShot app.py
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --name LocalShot launcher.py
 if errorlevel 1 goto error
 echo Ready: dist\LocalShot\LocalShot.exe
 explorer dist\LocalShot
