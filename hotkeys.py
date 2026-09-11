@@ -6,12 +6,15 @@ from PySide6.QtGui import QKeySequence
 
 DEFAULTS = {1: 'Ctrl+Alt+A', 2: 'Ctrl+Alt+S', 3: 'Ctrl+Alt+O'}
 LABELS = {1: 'Выделить область', 2: 'Весь текущий экран', 3: 'Открыть папку снимков'}
+EDITOR_SHORTCUTS = {'Ctrl+S', 'Ctrl+Shift+S', 'Ctrl+C', 'Ctrl+O', 'Ctrl+Shift+O', 'Ctrl+Z', 'Ctrl+Y'}
 
 
 def parse_shortcut(text):
     if not text.strip():
         return '', None
     sequence = QKeySequence.fromString(text, QKeySequence.SequenceFormat.PortableText)
+    if sequence.toString(QKeySequence.SequenceFormat.PortableText) in EDITOR_SHORTCUTS:
+        raise ValueError('Это сочетание используется в редакторе. Добавьте Alt или выберите другую клавишу.')
     if sequence.count() != 1:
         raise ValueError('Нужно одно сочетание клавиш, не последовательность.')
     combination = sequence[0]

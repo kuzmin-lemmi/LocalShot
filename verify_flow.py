@@ -1,14 +1,16 @@
 """Native full flow using a synthetic desktop window and isolated preferences."""
 import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 from PIL import Image
 from PySide6.QtCore import QPoint, QSettings, Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QMessageBox
+from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QFileDialog, QDialogButtonBox, QLineEdit
 from app import ShotApp
 from dialogs import CaptureDialog, HotkeyDialog
+from imaging import edit
 
 
 def main():
@@ -17,6 +19,7 @@ def main():
     settings = QSettings(str(folder / 'flow-test.ini'), QSettings.Format.IniFormat)
     settings.clear()
     app = ShotApp(settings=settings, enable_hotkeys=False)
+    app.file_dialog_options = QFileDialog.Option.DontUseNativeDialog
     app.folder = folder
     background = QWidget()
     background.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -62,19 +65,35 @@ def main():
         assert editor.canvas.image.tobytes() == changed
         editor.width.setValue(9)
         editor.font_size.setValue(36)
-        destination = folder / 'flow-saved.png'
-        with patch('app.QFileDialog.getSaveFileName', return_value=(str(destination), 'PNG')), \
-                patch('app.QMessageBox.question', return_value=QMessageBox.StandardButton.Yes):
-            assert editor.save_as() == destination
-        with Image.open(destination) as saved:
-            assert saved.tobytes() == changed
+        def complete_file_dialog(path, role):
+            dialog = app.activeModalWidget()
+            assert isinstance(dialog, QFileDialog)
+            dialog.setDirectory(str(path.parent))
+            field = dialog.findChild(QLineEdit, 'fileNameEdit')
+            field.setFocus()
+            field.selectAll()
+            QTest.keyClicks(field, path.name)
+            buttons = dialog.findChild(QDialogButtonBox)
+            QTest.mouseClick(buttons.button(role), Qt.MouseButton.LeftButton)
+
+        with tempfile.TemporaryDirectory(dir=folder) as temporary:
+            destination = Path(temporary) / 'flow-saved.png'
+            QTimer.singleShot(100, lambda: complete_file_dialog(destination, QDialogButtonBox.StandardButton.Save))
+            saved_path = editor.save_as()
+            assert saved_path == destination, (str(saved_path), str(destination))
+            editor.canvas.commit(edit(editor.canvas.image, 'line', (100, 100), (150, 150), 'red'))
+            changed = editor.canvas.image.tobytes()
+            assert editor.save() == destination
+            with Image.open(destination) as saved:
+                assert saved.tobytes() == changed
+            QTimer.singleShot(100, lambda: complete_file_dialog(destination, QDialogButtonBox.StandardButton.Open))
+            reopened = app.open_image()
+            assert reopened.canvas.image.tobytes() == changed
+            assert not reopened.dirty
+            assert reopened.width.value() == 9 and reopened.font_size.value() == 36
+            reopened.close()
         editor.grab().save(str(folder / 'editor-flow.png'))
         editor.close()
-        reopened = app.load_image(destination)
-        assert reopened.canvas.image.tobytes() == changed
-        assert not reopened.dirty
-        assert reopened.width.value() == 9 and reopened.font_size.value() == 36
-        reopened.close()
         dialog = HotkeyDialog(app)
         dialog.fields[1].setKeySequence(QKeySequence('Ctrl+Shift+F8'))
         dialog.apply()
@@ -88,6 +107,7 @@ def main():
         report = {'platform': app.platformName(), 'capture_preview_edit_save_reopen': True,
                   'image_size': list(editor.canvas.image.size), 'undo_redo': True,
                   'preferences_persisted': True, 'hotkey_dialog': True,
+                  'real_file_dialogs': True, 'named_file_updated': True,
                   'settings_file': settings.fileName()}
         (folder / 'flow-check.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         print(json.dumps(report, ensure_ascii=False, indent=2))

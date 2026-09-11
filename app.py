@@ -57,6 +57,8 @@ class Canvas(QWidget):
         self.owner = owner
         self.history = []
         self.future = []
+        self.revision = 0
+        self.next_revision = 1
         self.start = None
         self.preview = None
         self.pan_start = None
@@ -107,16 +109,18 @@ class Canvas(QWidget):
         self.future.clear()
         self.trim_history()
         self.image = result
+        self.revision = self.next_revision
+        self.next_revision += 1
         self.refresh_image()
 
     def snapshot(self):
         # Packed RGB bytes have a measurable size, unlike Pillow's internal RGB storage.
-        return self.image.size, self.image.tobytes()
+        return self.image.size, self.image.tobytes(), self.revision
 
     @property
     def history_bytes(self):
-        return sum(sys.getsizeof(data) + sys.getsizeof(size) + sys.getsizeof(item)
-                   for item in self.history + self.future for size, data in [item])
+        return sum(sys.getsizeof(data) + sys.getsizeof(size) + sys.getsizeof(item) + sys.getsizeof(revision)
+                   for item in self.history + self.future for size, data, revision in [item])
 
     def trim_history(self):
         while (len(self.history) + len(self.future) > self.HISTORY_LIMIT
@@ -131,7 +135,8 @@ class Canvas(QWidget):
     def refresh_image(self):
         self.pixmap = to_pixmap(self.image)
         self.start = self.preview = None
-        self.owner.dirty = True
+        self.owner.dirty = self.revision != self.owner.saved_revision
+        self.owner.update_title()
         self.owner.update_history_actions()
         self.update()
 
@@ -174,7 +179,7 @@ class Canvas(QWidget):
     def undo(self):
         if self.history:
             self.future.append(self.snapshot())
-            size, data = self.history.pop()
+            size, data, self.revision = self.history.pop()
             self.image = Image.frombytes('RGB', size, data)
             self.trim_history()
             self.refresh_image()
@@ -182,7 +187,7 @@ class Canvas(QWidget):
     def redo(self):
         if self.future:
             self.history.append(self.snapshot())
-            size, data = self.future.pop()
+            size, data, self.revision = self.future.pop()
             self.image = Image.frombytes('RGB', size, data)
             self.trim_history()
             self.refresh_image()
@@ -204,8 +209,10 @@ class Editor(QMainWindow):
         if not QColor(self.color).isValid():
             self.color = '#ef4444'
         self.source_path = source_path
+        self.save_target = None
+        self.saved_revision = 0 if source_path is not None else None
         self.dirty = source_path is None
-        self.setWindowTitle('Локальный снимок — редактор')
+        self.update_title()
         self.setWindowIcon(app.windowIcon())
         self.resize(1120, 760)
         restore_window(self, app.settings, 'editor/geometry')
@@ -316,16 +323,28 @@ class Editor(QMainWindow):
             self.update_color_button()
 
     def save(self):
+        if self.save_target is not None:
+            return self.write_named_file(self.save_target, overwrite=True)
         path = self.app.save_image(self.canvas.image, self)
         if path:
-            self.dirty = False
-            self.statusBar().showMessage(f'Сохранено: {path}')
+            self.mark_saved(path)
         return path
 
+    def update_title(self):
+        path = self.save_target or self.source_path
+        name = path.name if path else 'Новый снимок'
+        self.setWindowTitle(f'{"* " if self.dirty else ""}{name} — Локальный снимок')
+
+    def mark_saved(self, path):
+        self.saved_revision = self.canvas.revision
+        self.dirty = False
+        self.update_title()
+        self.statusBar().showMessage(f'Сохранено: {path}')
+
     def save_as(self):
-        initial = self.source_path or (self.app.folder / 'Снимок.png')
+        initial = self.save_target or self.source_path or (Path(self.app.settings.value('files/save_directory', str(self.app.folder))) / 'Снимок.png')
         filename, _ = QFileDialog.getSaveFileName(self, 'Сохранить как', str(initial), 'PNG (*.png)',
-                                                options=QFileDialog.Option.DontConfirmOverwrite)
+                                                options=self.app.file_dialog_options | QFileDialog.Option.DontConfirmOverwrite)
         if not filename:
             return None
         path = Path(filename)
@@ -336,14 +355,18 @@ class Editor(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return None
+        return self.write_named_file(path, overwrite)
+
+    def write_named_file(self, path, overwrite):
         try:
             save_png_as(self.canvas.image, path, overwrite=overwrite)
         except Exception as error:
             logging.exception('Save as failed')
             QMessageBox.warning(self, 'Не удалось сохранить', str(error))
             return None
-        self.dirty = False
-        self.statusBar().showMessage(f'Сохранено: {path}')
+        self.save_target = path
+        self.app.settings.setValue('files/save_directory', str(path.parent))
+        self.mark_saved(path)
         return path
 
     def copy(self):
@@ -446,6 +469,7 @@ class ShotApp(QApplication):
         self.setQuitOnLastWindowClosed(False)
         self.settings = settings if settings is not None else QSettings()
         self.enable_hotkeys = enable_hotkeys
+        self.file_dialog_options = QFileDialog.Option(0)
         if initialize:
             self.initialize_ui()
 
@@ -566,7 +590,8 @@ class ShotApp(QApplication):
 
     def open_image(self):
         filename, _ = QFileDialog.getOpenFileName(self.activeWindow() or self.panel, 'Открыть изображение',
-                                                  str(self.folder), 'Изображения (*.png *.jpg *.jpeg *.bmp *.webp)')
+                                                  str(self.settings.value('files/open_directory', str(self.folder))), 'Изображения (*.png *.jpg *.jpeg *.bmp *.webp)',
+                                                  options=self.file_dialog_options)
         if filename:
             return self.load_image(Path(filename))
 
@@ -574,14 +599,16 @@ class ShotApp(QApplication):
         try:
             with Image.open(path) as source:
                 source = ImageOps.exif_transpose(source)
-                if source.mode == 'RGBA' or 'transparency' in source.info:
+                if 'A' in source.getbands() or 'transparency' in source.info:
                     rgba = source.convert('RGBA')
                     image = Image.new('RGBA', source.size, 'white')
                     image.alpha_composite(rgba)
                     image = image.convert('RGB')
                 else:
                     image = source.convert('RGB')
-            return self.open_editor(image, source_path=Path(path))
+            editor = self.open_editor(image, source_path=Path(path))
+            self.settings.setValue('files/open_directory', str(Path(path).parent))
+            return editor
         except Exception as error:
             logging.exception('Could not open image')
             QMessageBox.warning(self.panel, 'Не удалось открыть изображение', str(error))

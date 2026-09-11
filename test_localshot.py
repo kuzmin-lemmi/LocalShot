@@ -1,6 +1,9 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import tempfile
+import json
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -262,6 +265,75 @@ class LocalShotTests(unittest.TestCase):
         with patch('app.QFileDialog.getSaveFileName', return_value=('', '')):
             self.assertIsNone(editor.save_as())
 
+    def test_ctrl_s_updates_named_file(self):
+        editor = self.make_editor()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'named.png'
+            with patch('app.QFileDialog.getSaveFileName', return_value=(str(path), 'PNG')):
+                self.assertEqual(editor.save_as(), path)
+            editor.canvas.commit(edit(editor.canvas.image, 'hide', (0, 0), (99, 79), 'black'))
+            with patch.object(self.app, 'save_image', side_effect=AssertionError('must use named file')):
+                self.assertEqual(editor.save(), path)
+            self.assertEqual(len(list(Path(tmp).iterdir())), 1)
+            with Image.open(path) as saved:
+                self.assertEqual(saved.getextrema(), ((0, 0),) * 3)
+            self.assertFalse(editor.dirty)
+            self.assertIn('named.png', editor.windowTitle())
+
+    def test_undo_to_saved_revision_and_branch(self):
+        editor = self.make_editor()
+        canvas = editor.canvas
+        canvas.commit(edit(canvas.image, 'hide', (0, 0), (5, 5), 'black'))
+        editor.mark_saved(Path('saved.png'))
+        canvas.commit(edit(canvas.image, 'hide', (10, 10), (20, 20), 'red'))
+        self.assertTrue(editor.dirty)
+        canvas.undo()
+        self.assertFalse(editor.dirty)
+        canvas.redo()
+        self.assertTrue(editor.dirty)
+        canvas.undo()
+        canvas.undo()
+        self.assertTrue(editor.dirty)
+        canvas.commit(edit(canvas.image, 'hide', (10, 10), (20, 20), 'blue'))
+        self.assertTrue(editor.dirty)
+        self.assertFalse(canvas.future)
+
+    def test_clean_saved_revision_closes_without_prompt(self):
+        editor = self.make_editor()
+        editor.mark_saved(Path('saved.png'))
+        editor.canvas.commit(edit(editor.canvas.image, 'line', (0, 0), (40, 40)))
+        editor.canvas.undo()
+        with patch('app.QMessageBox.question', side_effect=AssertionError('no unsaved changes')):
+            self.assertTrue(editor.close())
+
+    def test_named_save_failure_blocks_close(self):
+        editor = self.make_editor()
+        editor.save_target = Path('named.png')
+        with patch('app.save_png_as', side_effect=PermissionError('locked')), \
+                patch('app.QMessageBox.warning'), self.assertLogs(level='ERROR'), \
+                patch('app.QMessageBox.question', return_value=QMessageBox.StandardButton.Save):
+            self.assertFalse(editor.close())
+        self.assertTrue(editor.dirty)
+
+    def test_grayscale_alpha_opens_on_white(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'gray.png'
+            Image.new('LA', (5, 5), (0, 0)).save(path)
+            editor = self.app.load_image(path)
+            self.assertEqual(editor.canvas.image.getpixel((0, 0)), (255, 255, 255))
+            self.assertEqual(self.app.settings.value('files/open_directory'), str(path.parent))
+            editor.close()
+
+    def test_save_directory_remembered(self):
+        editor = self.make_editor()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'named.png'
+            self.assertEqual(editor.write_named_file(path, False), path)
+            other = self.make_editor()
+            with patch('app.QFileDialog.getSaveFileName', return_value=('', '')) as choose:
+                other.save_as()
+                self.assertEqual(Path(choose.call_args.args[2]).parent, path.parent)
+
     def test_folder_creation_denied(self):
         with patch.object(Path, 'mkdir', side_effect=PermissionError('denied')):
             with self.assertRaises(PermissionError):
@@ -284,6 +356,18 @@ class LocalShotTests(unittest.TestCase):
         self.assertEqual(other.font_size.value(), 48)
         self.assertEqual(other.color, '#00ff00')
         self.assertEqual(other.size().width(), 700)
+
+    def test_preferences_readable_in_new_process(self):
+        editor = self.make_editor()
+        editor.width.setValue(17)
+        editor.font_size.setValue(54)
+        editor.dirty = False
+        editor.close()
+        code = ('import json,sys; from PySide6.QtCore import QSettings; '
+                's=QSettings(sys.argv[1], QSettings.Format.IniFormat); '
+                'print(json.dumps([int(s.value("editor/width")),int(s.value("editor/font_size"))]))')
+        values = subprocess.check_output([sys.executable, '-c', code, self.app.settings.fileName()], text=True)
+        self.assertEqual(json.loads(values), [17, 54])
 
     def test_bad_preferences_fall_back(self):
         self.app.settings.setValue('editor/width', 'broken')
@@ -424,6 +508,17 @@ class HotkeyTests(unittest.TestCase):
         self.assertEqual(self.hotkeys.id_actions[self.hotkeys.registrations[parse_shortcut(DEFAULTS[2])[1]]], 1)
         self.assertEqual(self.app.settings.value('hotkeys/3'), '')
 
+    def test_custom_bindings_reload(self):
+        requested = {1: 'Ctrl+Shift+F9', 2: 'Alt+F10', 3: ''}
+        self.hotkeys.configure(requested)
+        self.hotkeys.cleanup()
+        other = Hotkeys(self.app, backend=self.backend)
+        try:
+            self.assertEqual(other.bindings, requested)
+            self.assertEqual(len(other.ids), 2)
+        finally:
+            other.cleanup()
+
     def test_duplicate_shortcuts_rejected(self):
         with self.assertRaises(ValueError):
             self.hotkeys.configure({1: 'Ctrl+Alt+X', 2: 'Ctrl+Alt+X', 3: ''})
@@ -434,6 +529,11 @@ class HotkeyTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 parse_shortcut(text)
         self.assertEqual(parse_shortcut('Ctrl+Shift+F9')[1], (0x4006, 0x78))
+
+    def test_editor_shortcuts_cannot_be_registered_globally(self):
+        for text in ('Ctrl+S', 'Ctrl+Shift+S', 'Ctrl+O', 'Ctrl+C', 'Ctrl+Z', 'Ctrl+Y'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_shortcut(text)
 
     def test_autostart_frozen_command_is_quoted(self):
         with patch('startup.sys.executable', 'C:\\Apps With Spaces\\LocalShot.exe'), patch('startup.sys.frozen', True, create=True):
