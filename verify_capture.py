@@ -2,14 +2,18 @@
 import json
 from pathlib import Path
 from unittest.mock import patch
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, QSettings
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QWidget
 from app import ShotApp
 
 
 def main():
-    app = ShotApp()
+    folder = Path(__file__).parent / 'verification-output'
+    folder.mkdir(exist_ok=True)
+    settings = QSettings(str(folder / 'capture-test.ini'), QSettings.Format.IniFormat)
+    settings.clear()
+    app = ShotApp(settings=settings, enable_hotkeys=False)
     results = []
     captured = []
     def finish(image):

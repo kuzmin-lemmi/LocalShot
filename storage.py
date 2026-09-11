@@ -1,5 +1,8 @@
 """Exclusive PNG writes: never overwrite another file or leave a partial PNG."""
 import logging
+import os
+from pathlib import Path
+import tempfile
 from datetime import datetime
 from uuid import uuid4
 
@@ -25,3 +28,24 @@ def save_png(image, folder):
             raise
         return path
     raise OSError('Не удалось подобрать свободное имя снимка.')
+
+
+def save_png_as(image, path, overwrite=False):
+    """Encode completely before replacing an explicitly approved destination."""
+    path = Path(path)
+    descriptor, name = tempfile.mkstemp(prefix='.localshot-', suffix='.tmp', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            image.convert('RGB').save(stream, format='PNG')
+            stream.flush()
+            os.fsync(stream.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        elif os.name == 'nt':
+            os.rename(temporary, path)  # Windows fails if destination already exists.
+        else:
+            os.link(temporary, path)  # Exclusive creation on POSIX as well.
+        return path
+    finally:
+        temporary.unlink(missing_ok=True)

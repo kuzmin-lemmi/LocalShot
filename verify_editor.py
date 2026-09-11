@@ -5,17 +5,19 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
 from time import perf_counter
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt, QSettings
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
 from app import ShotApp, Editor
 
 
 def main():
-    app = ShotApp()
-    app.panel.hide()
     folder = Path(__file__).parent / 'verification-output'
     folder.mkdir(exist_ok=True)
+    settings = QSettings(str(folder / 'editor-test.ini'), QSettings.Format.IniFormat)
+    settings.clear()
+    app = ShotApp(settings=settings, enable_hotkeys=False)
+    app.panel.hide()
     source = Image.new('RGB', (3840, 2160), '#f8fafc')
     draw = ImageDraw.Draw(source)
     for x in range(0, 3840, 160):

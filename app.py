@@ -1,20 +1,23 @@
-import ctypes
 import logging
 import math
 import sys
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import (Qt, QRect, QRectF, QPointF, QTimer, QSettings, QUrl,
-                           QAbstractNativeEventFilter, QLockFile, QStandardPaths)
+                           QLockFile, QStandardPaths)
 from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QIcon,
                            QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QPushButton, QLabel, QSystemTrayIcon, QMenu, QFileDialog,
+    QPushButton, QLabel, QSystemTrayIcon, QMenu, QFileDialog, QCheckBox,
     QMessageBox, QScrollArea, QColorDialog, QSpinBox, QInputDialog, QToolBar)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from imaging import edit
-from storage import save_png
+from storage import save_png, save_png_as
+from hotkeys import Hotkeys, LABELS
+from dialogs import HotkeyDialog, CaptureDialog
+from preferences import integer, restore_window
+import startup
 
 
 def to_pil(pixmap):
@@ -193,15 +196,19 @@ class Canvas(QWidget):
 
 
 class Editor(QMainWindow):
-    def __init__(self, image, app):
+    def __init__(self, image, app, source_path=None):
         super().__init__()
         self.app = app
         self.tool = 'arrow'
-        self.color = '#ef4444'
-        self.dirty = True
+        self.color = str(app.settings.value('editor/color', '#ef4444'))
+        if not QColor(self.color).isValid():
+            self.color = '#ef4444'
+        self.source_path = source_path
+        self.dirty = source_path is None
         self.setWindowTitle('Локальный снимок — редактор')
         self.setWindowIcon(app.windowIcon())
         self.resize(1120, 760)
+        restore_window(self, app.settings, 'editor/geometry')
         self.canvas = Canvas(image, self)
         self.scroll = scroll = QScrollArea()
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -225,12 +232,14 @@ class Editor(QMainWindow):
         bar.setStyleSheet('QToolButton:checked { background: #bfdbfe; border: 2px solid #2563eb; }')
         self.width = QSpinBox()
         self.width.setRange(1, 30)
-        self.width.setValue(5)
+        self.width.setValue(integer(app.settings, 'editor/width', 5, 1, 30))
+        self.width.valueChanged.connect(lambda value: app.settings.setValue('editor/width', value))
         self.width.setPrefix('Линия: ')
         bar.addWidget(self.width)
         self.font_size = QSpinBox()
         self.font_size.setRange(10, 160)
-        self.font_size.setValue(28)
+        self.font_size.setValue(integer(app.settings, 'editor/font_size', 28, 10, 160))
+        self.font_size.valueChanged.connect(lambda value: app.settings.setValue('editor/font_size', value))
         self.font_size.setPrefix('Текст: ')
         bar.addWidget(self.font_size)
         self.addToolBarBreak()
@@ -240,9 +249,11 @@ class Editor(QMainWindow):
         self.history_actions = {}
         for label, callback, shortcut in [
             ('Сохранить', self.save, 'Ctrl+S'), ('Копировать', self.copy, 'Ctrl+C'),
+            ('Сохранить как…', self.save_as, 'Ctrl+Shift+S'),
+            ('Открыть…', app.open_image, 'Ctrl+O'),
             ('Отменить правку', self.canvas.undo, 'Ctrl+Z'),
             ('Повторить правку', self.canvas.redo, 'Ctrl+Y'),
-            ('Открыть папку', app.open_folder, 'Ctrl+O')]:
+            ('Открыть папку', app.open_folder, 'Ctrl+Shift+O')]:
             action = actions.addAction(label, callback)
             action.setShortcut(QKeySequence(shortcut))
             if shortcut in ('Ctrl+Z', 'Ctrl+Y'):
@@ -301,6 +312,7 @@ class Editor(QMainWindow):
         color = QColorDialog.getColor(QColor(self.color), self)
         if color.isValid():
             self.color = color.name()
+            self.app.settings.setValue('editor/color', self.color)
             self.update_color_button()
 
     def save(self):
@@ -308,6 +320,30 @@ class Editor(QMainWindow):
         if path:
             self.dirty = False
             self.statusBar().showMessage(f'Сохранено: {path}')
+        return path
+
+    def save_as(self):
+        initial = self.source_path or (self.app.folder / 'Снимок.png')
+        filename, _ = QFileDialog.getSaveFileName(self, 'Сохранить как', str(initial), 'PNG (*.png)',
+                                                options=QFileDialog.Option.DontConfirmOverwrite)
+        if not filename:
+            return None
+        path = Path(filename)
+        if path.suffix.lower() != '.png':
+            path = path.with_suffix('.png')
+        overwrite = path.exists()
+        if overwrite and QMessageBox.question(self, 'Заменить файл?', f'Заменить файл «{path.name}»?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return None
+        try:
+            save_png_as(self.canvas.image, path, overwrite=overwrite)
+        except Exception as error:
+            logging.exception('Save as failed')
+            QMessageBox.warning(self, 'Не удалось сохранить', str(error))
+            return None
+        self.dirty = False
+        self.statusBar().showMessage(f'Сохранено: {path}')
         return path
 
     def copy(self):
@@ -323,6 +359,8 @@ class Editor(QMainWindow):
                 event.ignore()
                 return
         event.accept()
+        self.app.settings.setValue('editor/geometry', self.saveGeometry())
+        self.app.settings.sync()
         if self in self.app.editors:
             self.app.editors.remove(self)
 
@@ -383,53 +421,36 @@ class Overlay(QWidget):
             self.app.cancel_capture()
 
 
-class Hotkeys(QAbstractNativeEventFilter):
+class MainPanel(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.ids = []
-        self.errors = []
-        if sys.platform == 'win32':
-            for ident, key, label in [(1, 0x41, 'Ctrl+Alt+A'), (2, 0x53, 'Ctrl+Alt+S'), (3, 0x4F, 'Ctrl+Alt+O')]:
-                if ctypes.windll.user32.RegisterHotKey(None, ident, 0x4003, key):
-                    self.ids.append(ident)
-                else:
-                    self.errors.append(label)
 
-    def nativeEventFilter(self, event_type, message):
-        if sys.platform == 'win32':
-            from ctypes.wintypes import MSG
-            msg = MSG.from_address(int(message))
-            if msg.message == 0x0312:
-                ident = int(msg.wParam)
-                if ident not in self.ids:
-                    return False, 0
-                if ident == 3:
-                    self.app.open_folder()
-                else:
-                    self.app.capture(ident == 2)
-                return True, 0
-        return False, 0
-
-    def cleanup(self):
-        if sys.platform == 'win32':
-            for ident in self.ids:
-                ctypes.windll.user32.UnregisterHotKey(None, ident)
-        self.ids.clear()
+    def closeEvent(self, event):
+        self.app.settings.setValue('panel/geometry', self.saveGeometry())
+        self.app.settings.sync()
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            self.hide()
+        elif self.app.exit_app():
+            event.accept()
+        else:
+            event.ignore()
 
 
 class ShotApp(QApplication):
-    def __init__(self, initialize=True):
+    def __init__(self, initialize=True, settings=None, enable_hotkeys=True):
         super().__init__(sys.argv)
         self.setApplicationName('LocalShot')
         self.setOrganizationName('LocalShot')
         self.setQuitOnLastWindowClosed(False)
+        self.settings = settings if settings is not None else QSettings()
+        self.enable_hotkeys = enable_hotkeys
         if initialize:
             self.initialize_ui()
 
     def initialize_ui(self):
         self.setWindowIcon(icon())
-        self.settings = QSettings()
         self.folder = Path(self.settings.value('folder', str(Path.home() / 'Pictures' / 'LocalShot')))
         self.editors, self.overlays, self.hidden = [], [], []
         self.capturing = False
@@ -440,45 +461,131 @@ class ShotApp(QApplication):
         self.screenAdded.connect(self.watch_screen)
         for screen in self.screens():
             self.watch_screen(screen)
-        self.panel = QWidget()
+        self.panel = MainPanel(self)
         self.panel.setWindowTitle('Локальный снимок')
         self.panel.setWindowIcon(self.windowIcon())
         self.panel.resize(500, 340)
+        restore_window(self.panel, self.settings, 'panel/geometry')
         layout = QVBoxLayout(self.panel)
         title = QLabel('Локальный снимок')
         title.setStyleSheet('font-size: 25px; font-weight: 700')
         layout.addWidget(title)
         layout.addWidget(QLabel('Снимки и пометки для уроков — на вашем компьютере.'))
-        for label, fn in [('Выделить область    Ctrl+Alt+A', lambda: self.capture(False)),
-                          ('Весь текущий экран    Ctrl+Alt+S', lambda: self.capture(True)),
-                          ('Открыть папку    Ctrl+Alt+O', self.open_folder),
+        self.capture_buttons = []
+        for label, fn in [('Выделить область', lambda: self.capture(False)),
+                          ('Весь текущий экран', lambda: self.capture(True)),
+                          ('Открыть папку снимков', self.open_folder),
+                          ('Открыть изображение…', self.open_image),
+                          ('Горячие клавиши…', self.configure_hotkeys),
                           ('Выбрать папку сохранения', self.choose_folder)]:
             button = QPushButton(label)
             button.setMinimumHeight(36)
             button.clicked.connect(fn)
             layout.addWidget(button)
+            self.capture_buttons.append(button)
         self.folder_label = QLabel(str(self.folder))
         self.folder_label.setWordWrap(True)
         layout.addWidget(self.folder_label)
-        layout.addWidget(QLabel('Закрытие окна оставляет приложение возле часов.'))
+        self.tray_hint = QLabel()
+        self.tray_hint.setWordWrap(True)
+        layout.addWidget(self.tray_hint)
+        self.startup_checkbox = QCheckBox('Запускать при входе в Windows')
+        self.startup_checkbox.setChecked(self.settings.value('startup/enabled', True, type=bool))
+        self.startup_checkbox.setEnabled(sys.platform == 'win32')
+        self.startup_checkbox.toggled.connect(self.set_autostart)
+        layout.addWidget(self.startup_checkbox)
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         self.tray.setToolTip('Локальный снимок — двойной щелчок открывает папку')
         menu = QMenu()
         menu.addAction('Выделить область', lambda: self.capture(False))
         menu.addAction('Весь текущий экран', lambda: self.capture(True))
         menu.addAction('Открыть папку', self.open_folder)
+        menu.addAction('Открыть изображение…', self.open_image)
+        menu.addAction('Горячие клавиши…', self.configure_hotkeys)
         menu.addAction('Главное окно', self.show_panel)
         menu.addSeparator()
         menu.addAction('Выход', self.exit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda reason: self.open_folder() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
-        self.tray.show()
-        self.hotkeys = Hotkeys(self)
+        self.hotkeys = Hotkeys(self, backend=None if self.enable_hotkeys else False)
         self.installNativeEventFilter(self.hotkeys)
         self.aboutToQuit.connect(self.hotkeys.cleanup)
-        if self.hotkeys.errors:
-            layout.addWidget(QLabel('Клавиши заняты другой программой: ' + ', '.join(self.hotkeys.errors) + '. Используйте кнопки или меню возле часов.'))
-        self.panel.show()
+        self.hotkey_status = QLabel()
+        self.hotkey_status.setWordWrap(True)
+        layout.addWidget(self.hotkey_status)
+        self.update_hotkey_labels()
+        self.tray_timer = QTimer(self)
+        self.tray_timer.timeout.connect(self.check_tray)
+        self.tray_timer.start(2000)
+        self.check_tray()
+        if '--autostart' not in sys.argv or not QSystemTrayIcon.isSystemTrayAvailable():
+            self.panel.show()
+
+    def set_autostart(self, enabled):
+        try:
+            startup.set_enabled(enabled)
+        except OSError as error:
+            logging.exception('Startup setting failed')
+            self.startup_checkbox.blockSignals(True)
+            self.startup_checkbox.setChecked(not enabled)
+            self.startup_checkbox.blockSignals(False)
+            QMessageBox.warning(self.panel, 'Не удалось изменить автозапуск', str(error))
+            return False
+        self.settings.setValue('startup/enabled', enabled)
+        self.settings.sync()
+        self.startup_checkbox.blockSignals(True)
+        self.startup_checkbox.setChecked(enabled)
+        self.startup_checkbox.blockSignals(False)
+        return True
+
+    def initialize_autostart(self):
+        if sys.platform == 'win32':
+            self.set_autostart(self.settings.value('startup/enabled', True, type=bool))
+
+    def update_hotkey_labels(self):
+        for action, button in enumerate(self.capture_buttons[:3], 1):
+            text = self.hotkeys.bindings[action]
+            button.setText(LABELS[action] + ('    ' + text if text else ''))
+        self.hotkey_status.setText('\n'.join(self.hotkeys.errors))
+        self.hotkey_status.setVisible(bool(self.hotkeys.errors))
+
+    def configure_hotkeys(self):
+        dialog = HotkeyDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def check_tray(self):
+        available = QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray_hint.setText('Закрытие окна оставляет приложение возле часов.' if available else
+                              'Трей недоступен. Закрытие окна завершит программу после проверки несохранённых снимков.')
+        if available:
+            if not self.tray.isVisible():
+                self.tray.show()
+        elif not self.capturing and not self.panel.isVisible():
+            self.show_panel()
+
+    def open_image(self):
+        filename, _ = QFileDialog.getOpenFileName(self.activeWindow() or self.panel, 'Открыть изображение',
+                                                  str(self.folder), 'Изображения (*.png *.jpg *.jpeg *.bmp *.webp)')
+        if filename:
+            return self.load_image(Path(filename))
+
+    def load_image(self, path):
+        try:
+            with Image.open(path) as source:
+                source = ImageOps.exif_transpose(source)
+                if source.mode == 'RGBA' or 'transparency' in source.info:
+                    rgba = source.convert('RGBA')
+                    image = Image.new('RGBA', source.size, 'white')
+                    image.alpha_composite(rgba)
+                    image = image.convert('RGB')
+                else:
+                    image = source.convert('RGB')
+            return self.open_editor(image, source_path=Path(path))
+        except Exception as error:
+            logging.exception('Could not open image')
+            QMessageBox.warning(self.panel, 'Не удалось открыть изображение', str(error))
+            return None
 
     def watch_screen(self, screen):
         screen.geometryChanged.connect(self.screen_changed)
@@ -573,38 +680,36 @@ class ShotApp(QApplication):
     def finish_capture(self, image):
         self.cancel_capture()
         self.capturing = True
-        dialog = QMessageBox(self.panel)
-        dialog.setWindowTitle('Область готова')
-        dialog.setText(f'Снимок {image.width} × {image.height}. Что сделать?')
-        save = dialog.addButton('Сохранить', QMessageBox.ButtonRole.AcceptRole)
-        editor = dialog.addButton('Редактировать', QMessageBox.ButtonRole.ActionRole)
-        copy = dialog.addButton('Копировать', QMessageBox.ButtonRole.ActionRole)
-        dialog.addButton('Отмена', QMessageBox.ButtonRole.RejectRole)
+        dialog = CaptureDialog(image, to_pixmap(image), self.panel)
         try:
             dialog.exec()
-            chosen = dialog.clickedButton()
+            chosen = dialog.choice
         finally:
             self.capturing = False
             dialog.deleteLater()
-        if chosen == save:
+        if chosen == 'save':
             if not self.save_image(image):
                 self.open_editor(image)
-        elif chosen == editor:
+        elif chosen == 'edit':
             self.open_editor(image)
-        elif chosen == copy:
+        elif chosen == 'copy':
             self.clipboard().setPixmap(to_pixmap(image))
 
-    def open_editor(self, image):
-        editor = Editor(image, self)
+    def open_editor(self, image, source_path=None):
+        editor = Editor(image, self, source_path=source_path)
         self.editors.append(editor)
         editor.show()
         editor.activateWindow()
+        return editor
 
     def exit_app(self):
         for editor in list(self.editors):
             if not editor.close():
-                return
+                return False
+        self.settings.setValue('panel/geometry', self.panel.saveGeometry())
+        self.settings.sync()
         self.quit()
+        return True
 
 
 def main():
@@ -628,6 +733,9 @@ def main():
     if not app.server.listen('LocalShot.Desktop.v1'):
         raise RuntimeError('Не удалось запустить локальный сервер: ' + app.server.errorString())
     app.initialize_ui()
+    app.initialize_autostart()
+    if '--autostart' in sys.argv and QSystemTrayIcon.isSystemTrayAvailable():
+        app.panel.hide()
     def activate():
         socket = app.server.nextPendingConnection()
         if socket:

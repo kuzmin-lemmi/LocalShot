@@ -12,10 +12,12 @@ def run(report_path):
         from app import ShotApp, Editor, to_pil, to_pixmap
         from imaging import edit
         from storage import save_png
-        app = ShotApp(initialize=False)
-        app.editors = []
-        app.open_folder = lambda: None
+        from PySide6.QtCore import QSettings
         with tempfile.TemporaryDirectory() as temporary:
+            app = ShotApp(initialize=False, settings=QSettings(str(Path(temporary) / 'settings.ini'), QSettings.Format.IniFormat))
+            app.editors = []
+            app.folder = Path(temporary)
+            app.open_folder = lambda: None
             app.save_image = lambda image, parent=None: save_png(image, Path(temporary))
             source = Image.new('RGB', (640, 360), 'white')
             assert to_pil(to_pixmap(source)).tobytes() == source.tobytes()

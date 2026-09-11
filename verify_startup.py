@@ -11,10 +11,13 @@ def child():
     from PySide6.QtWidgets import QSystemTrayIcon
     original = app.ShotApp
     class TimedApp(original):
+        def initialize_autostart(self):
+            pass  # Verification must not change the user's startup settings.
+
         def initialize_ui(self):
             super().initialize_ui()
             print(json.dumps({'initialized': True, 'hotkeys': self.hotkeys.ids,
-                              'hotkey_errors': self.hotkeys.errors,
+                              'hotkey_errors': self.hotkeys.errors, 'actions': sorted(self.hotkeys.id_actions.values()),
                               'tray_available': QSystemTrayIcon.isSystemTrayAvailable()}), flush=True)
             QTimer.singleShot(5000, self.quit)
     app.ShotApp = TimedApp
@@ -30,7 +33,7 @@ def main():
     assert one.returncode == two.returncode == 0, (one.returncode, two.returncode, ae, be)
     initialized = [json.loads(line) for line in (a + b).splitlines() if line.strip()]
     assert len(initialized) == 1, initialized
-    assert initialized[0]['hotkeys'] == [1, 2, 3], initialized
+    assert initialized[0]['actions'] == [1, 2, 3], initialized
     result = {'two_simultaneous_processes': 'passed', 'ui_initializations': len(initialized),
               'instance': initialized[0]}
     folder = Path(__file__).parent / 'verification-output'
